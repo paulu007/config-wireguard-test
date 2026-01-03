@@ -31,7 +31,7 @@ sudo make install
 ## Usage
 
 ```bash
-sudo python3 awg_tester.py -c ./conf \
+sudo python3 main.py -c ./conf \
     --h1 12345 --h2 67890 --h3 11111 --h4 22222 \
     --jc-values 0,3,5,10,15 \
     --jmin-values 40,50,64 \
