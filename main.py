@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-AmneziaWG Configuration Tester - FIXED VERSION
-Properly detects and requires AmneziaWG (not standard WireGuard)
+WireGuard Configuration Tester & Generator with Junk Packet Variations
+Reads configs from directory, tests them, generates variations with different Jc/Jmin/Jmax
+
+Supports: Linux and Windows
+Requires: AmneziaWG or WireGuard with junk packet support
+
+Usage:
+Linux: sudo python3 wg_junk_tester.py --config-dir ./conf
+Windows: python wg_junk_tester.py --config-dir .\conf (Run as Administrator)
 """
 
 import os
@@ -18,904 +25,954 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
-from itertools import product
-
-
-# =============================================================================
-# DATA CLASSES
-# =============================================================================
+from copy import deepcopy
+=============================================================================
+CONFIGURATION CLASSES
+=============================================================================
 
 @dataclass
-class AWGParams:
-    """AmneziaWG obfuscation parameters"""
-    Jc: int = 0
-    Jmin: int = 40
-    Jmax: int = 70
-    S1: int = 0
-    S2: int = 0
-    H1: int = 1
-    H2: int = 2
-    H3: int = 3
-    H4: int = 4
+class JunkPacketParams:
+"""Junk packet obfuscation parameters"""
+Jc: int = 0 # Junk packet count
+Jmin: int = 40 # Junk packet minimum size
+Jmax: int = 70 # Junk packet maximum size
+S1: int = 0 # Init packet junk size
+S2: int = 0 # Response packet junk size
+H1: int = 1 # Init packet magic header
+H2: int = 2 # Response packet magic header
+H3: int = 3 # Under load packet magic header
+H4: int = 4 # Transport packet magic header
 
-    def to_dict(self) -> Dict[str, int]:
-        return vars(self).copy()
+text
 
-    def to_config_lines(self) -> List[str]:
-        return [
-            f"Jc = {self.Jc}",
-            f"Jmin = {self.Jmin}",
-            f"Jmax = {self.Jmax}",
-            f"S1 = {self.S1}",
-            f"S2 = {self.S2}",
-            f"H1 = {self.H1}",
-            f"H2 = {self.H2}",
-            f"H3 = {self.H3}",
-            f"H4 = {self.H4}",
-        ]
+def to_dict(self) -> Dict[str, int]:
+    return {
+        'Jc': self.Jc, 'Jmin': self.Jmin, 'Jmax': self.Jmax,
+        'S1': self.S1, 'S2': self.S2,
+        'H1': self.H1, 'H2': self.H2, 'H3': self.H3, 'H4': self.H4
+    }
 
-    def short_name(self) -> str:
-        return f"Jc{self.Jc}_Jmin{self.Jmin}_Jmax{self.Jmax}_S1{self.S1}_S2{self.S2}"
+def to_config_lines(self) -> List[str]:
+    """Convert to config file lines"""
+    lines = []
+    if self.Jc > 0:
+        lines.append(f"Jc = {self.Jc}")
+        lines.append(f"Jmin = {self.Jmin}")
+        lines.append(f"Jmax = {self.Jmax}")
+    if self.S1 > 0:
+        lines.append(f"S1 = {self.S1}")
+    if self.S2 > 0:
+        lines.append(f"S2 = {self.S2}")
+    if self.H1 != 1:
+        lines.append(f"H1 = {self.H1}")
+    if self.H2 != 2:
+        lines.append(f"H2 = {self.H2}")
+    if self.H3 != 3:
+        lines.append(f"H3 = {self.H3}")
+    if self.H4 != 4:
+        lines.append(f"H4 = {self.H4}")
+    return lines
 
-    def copy(self, **kwargs) -> 'AWGParams':
-        params = AWGParams(**vars(self))
-        for key, value in kwargs.items():
-            if hasattr(params, key):
-                setattr(params, key, value)
-        return params
-
+def describe(self) -> str:
+    """Short description for naming"""
+    return f"Jc{self.Jc}_Jmin{self.Jmin}_Jmax{self.Jmax}"
 
 @dataclass
 class WGConfig:
-    """Parsed WireGuard configuration"""
-    name: str
-    filepath: str
-    interface_lines: List[str] = field(default_factory=list)
-    peer_lines: List[str] = field(default_factory=list)
-    params: AWGParams = field(default_factory=AWGParams)
-    private_key: str = ""
-    address: str = ""
-    dns: str = ""
-    endpoint: str = ""
-    public_key: str = ""
+"""Parsed WireGuard configuration"""
+name: str
+filepath: str
+interface_lines: List[str] = field(default_factory=list)
+peer_lines: List[str] = field(default_factory=list)
+junk_params: JunkPacketParams = field(default_factory=JunkPacketParams)
+raw_content: str = ""
 
+text
+
+# Extracted values
+private_key: str = ""
+address: str = ""
+dns: str = ""
+mtu: int = 1420
+endpoint: str = ""
+public_key: str = ""
+allowed_ips: str = ""
+persistent_keepalive: int = 25
 
 @dataclass
 class TestResult:
-    """Test result"""
-    config_name: str
-    params: Dict[str, int]
-    success: bool = False
-    handshake_ok: bool = False
-    ping_avg_ms: float = 0.0
-    ping_min_ms: float = 0.0
-    ping_max_ms: float = 0.0
-    packet_loss: float = 100.0
-    error: str = ""
-    timestamp: str = ""
+"""Test result for a configuration"""
+config_name: str
+config_path: str
+junk_params: Dict[str, int]
+success: bool = False
+handshake_ok: bool = False
+handshake_time_ms: float = 0.0
+ping_times: List[float] = field(default_factory=list)
+ping_avg_ms: float = 0.0
+ping_min_ms: float = 0.0
+ping_max_ms: float = 0.0
+packet_loss_pct: float = 100.0
+errors: List[str] = field(default_factory=list)
+timestamp: str = ""
 
+text
 
-# =============================================================================
-# CONFIG PARSER
-# =============================================================================
+def to_dict(self) -> Dict[str, Any]:
+    return {
+        'config_name': self.config_name,
+        'config_path': self.config_path,
+        'junk_params': self.junk_params,
+        'success': self.success,
+        'handshake_ok': self.handshake_ok,
+        'handshake_time_ms': self.handshake_time_ms,
+        'ping_avg_ms': self.ping_avg_ms,
+        'ping_min_ms': self.ping_min_ms,
+        'ping_max_ms': self.ping_max_ms,
+        'packet_loss_pct': self.packet_loss_pct,
+        'errors': self.errors,
+        'timestamp': self.timestamp
+    }
+
+=============================================================================
+CONFIG PARSER
+=============================================================================
 
 class ConfigParser:
-    """Parse WireGuard/AmneziaWG configuration files"""
-    
-    AWG_PARAMS = {'Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'H1', 'H2', 'H3', 'H4'}
+"""Parse WireGuard configuration files"""
 
-    @classmethod
-    def parse(cls, filepath: str) -> WGConfig:
-        path = Path(filepath)
-        config = WGConfig(name=path.stem, filepath=str(path))
-        
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        section = None
-        for line in content.split('\n'):
-            line = line.strip()
-            
-            if not line or line.startswith('#'):
-                continue
-            
-            if line.lower() == '[interface]':
-                section = 'interface'
-                continue
-            elif line.lower() == '[peer]':
-                section = 'peer'
-                continue
-            
-            if '=' not in line:
-                continue
-                
-            key, value = [x.strip() for x in line.split('=', 1)]
-            
-            if key in cls.AWG_PARAMS:
+text
+
+# Parameters that are junk packet related
+JUNK_PARAMS = ['Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'H1', 'H2', 'H3', 'H4']
+
+@staticmethod
+def parse_file(filepath: str) -> WGConfig:
+    """Parse a WireGuard config file"""
+    filepath = Path(filepath)
+    config = WGConfig(
+        name=filepath.stem,
+        filepath=str(filepath)
+    )
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        config.raw_content = f.read()
+
+    lines = config.raw_content.split('\n')
+    current_section = None
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # Skip empty lines and comments
+        if not line_stripped or line_stripped.startswith('#'):
+            continue
+
+        # Section headers
+        if line_stripped.lower() == '[interface]':
+            current_section = 'interface'
+            continue
+        elif line_stripped.lower() == '[peer]':
+            current_section = 'peer'
+            continue
+
+        # Parse key = value
+        if '=' in line_stripped:
+            key, value = line_stripped.split('=', 1)
+            key = key.strip()
+            value = value.strip()
+
+            # Check if it's a junk parameter
+            if key in ConfigParser.JUNK_PARAMS:
                 try:
-                    setattr(config.params, key, int(value))
+                    setattr(config.junk_params, key, int(value))
                 except ValueError:
                     pass
                 continue
-            
-            if section == 'interface':
-                config.interface_lines.append(line)
-                key_lower = key.lower()
-                if key_lower == 'privatekey':
-                    config.private_key = value
-                elif key_lower == 'address':
-                    config.address = value
-                elif key_lower == 'dns':
-                    config.dns = value
-                    
-            elif section == 'peer':
-                config.peer_lines.append(line)
-                key_lower = key.lower()
-                if key_lower == 'publickey':
-                    config.public_key = value
-                elif key_lower == 'endpoint':
-                    config.endpoint = value
-        
-        return config
 
-    @classmethod
-    def parse_directory(cls, dirpath: str) -> List[WGConfig]:
-        configs = []
-        path = Path(dirpath)
-        
-        if not path.exists():
-            print(f"❌ Directory not found: {dirpath}")
-            return configs
-        
-        for conf_file in sorted(path.glob('*.conf')):
-            try:
-                config = cls.parse(str(conf_file))
-                configs.append(config)
-                print(f"  ✓ {conf_file.name}")
-                p = config.params
-                print(f"    Jc={p.Jc}, Jmin={p.Jmin}, Jmax={p.Jmax}, "
-                      f"S1={p.S1}, S2={p.S2}")
-                print(f"    H1={p.H1}, H2={p.H2}, H3={p.H3}, H4={p.H4}")
-            except Exception as e:
-                print(f"  ✗ {conf_file.name}: {e}")
-        
+            # Store in appropriate section
+            if current_section == 'interface':
+                config.interface_lines.append(line_stripped)
+
+                # Extract specific values
+                if key.lower() == 'privatekey':
+                    config.private_key = value
+                elif key.lower() == 'address':
+                    config.address = value
+                elif key.lower() == 'dns':
+                    config.dns = value
+                elif key.lower() == 'mtu':
+                    try:
+                        config.mtu = int(value)
+                    except:
+                        pass
+
+            elif current_section == 'peer':
+                config.peer_lines.append(line_stripped)
+
+                # Extract specific values
+                if key.lower() == 'publickey':
+                    config.public_key = value
+                elif key.lower() == 'endpoint':
+                    config.endpoint = value
+                elif key.lower() == 'allowedips':
+                    config.allowed_ips = value
+                elif key.lower() == 'persistentkeepalive':
+                    try:
+                        config.persistent_keepalive = int(value)
+                    except:
+                        pass
+
+    return config
+
+@staticmethod
+def parse_directory(dirpath: str) -> List[WGConfig]:
+    """Parse all .conf files in a directory"""
+    configs = []
+    dirpath = Path(dirpath)
+
+    if not dirpath.exists():
+        print(f"Error: Directory '{dirpath}' does not exist!")
         return configs
 
+    for conf_file in sorted(dirpath.glob('*.conf')):
+        try:
+            config = ConfigParser.parse_file(str(conf_file))
+            configs.append(config)
+            print(f"  Parsed: {conf_file.name}")
+        except Exception as e:
+            print(f"  Error parsing {conf_file.name}: {e}")
 
-# =============================================================================
-# CONFIG GENERATOR
-# =============================================================================
+    return configs
+
+=============================================================================
+CONFIG GENERATOR
+=============================================================================
 
 class ConfigGenerator:
-    """Generate config variations"""
-    
-    def __init__(self, output_dir: str):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    def generate(self, base_config: WGConfig, params: AWGParams, suffix: str = "") -> str:
-        lines = ["[Interface]"]
-        lines.extend(base_config.interface_lines)
-        lines.append("")
-        lines.extend(params.to_config_lines())
-        lines.append("")
-        lines.append("[Peer]")
-        lines.extend(base_config.peer_lines)
-        
-        if suffix:
-            filename = f"{base_config.name}_{suffix}.conf"
-        else:
-            filename = f"{base_config.name}_{params.short_name()}.conf"
-        
-        filepath = self.output_dir / filename
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-        
-        if platform.system() != "Windows":
-            os.chmod(filepath, 0o600)
-        
-        return str(filepath)
-    
-    def generate_variations(
-        self,
-        base_config: WGConfig,
-        jc_values: List[int],
-        jmin_values: List[int],
-        jmax_values: List[int],
-        s1_values: List[int],
-        s2_values: List[int],
-        h1: int, h2: int, h3: int, h4: int
-    ) -> List[Tuple[str, AWGParams]]:
-        variations = []
-        
-        for jc, jmin, jmax, s1, s2 in product(
-            jc_values, jmin_values, jmax_values, s1_values, s2_values
-        ):
-            if jmax <= jmin:
-                continue
-            
-            params = AWGParams(
-                Jc=jc, Jmin=jmin, Jmax=jmax,
-                S1=s1, S2=s2,
-                H1=h1, H2=h2, H3=h3, H4=h4
-            )
-            
-            filepath = self.generate(base_config, params)
-            variations.append((filepath, params))
-        
-        return variations
+"""Generate new configs with different junk packet parameters"""
 
+text
 
-# =============================================================================
-# AMNEZIAWG DETECTOR
-# =============================================================================
+# Test variations for junk parameters
+JUNK_COUNT_VALUES = [0, 1, 3, 5, 10, 15, 20, 30, 50]
+JUNK_MIN_VALUES = [20, 40, 50, 64, 100, 150]
+JUNK_MAX_VALUES = [70, 100, 150, 200, 300, 500, 1000]
+S1_VALUES = [0, 50, 100, 150, 200]
+S2_VALUES = [0, 50, 100, 150, 200]
 
-class AWGDetector:
-    """Detect and validate AmneziaWG installation"""
-    
-    def __init__(self):
-        self.system = platform.system()
-        self.awg_quick = None
-        self.awg_show = None
-        self.is_awg = False
-        
-        self._detect()
-    
-    def _detect(self):
-        """Detect AmneziaWG tools"""
-        if self.system == "Windows":
-            self._detect_windows()
-        else:
-            self._detect_linux()
-    
-    def _detect_linux(self):
-        """Detect on Linux"""
-        # Check for awg-quick (AmneziaWG)
-        awg_quick = shutil.which("awg-quick")
-        if awg_quick:
-            self.awg_quick = awg_quick
-            self.is_awg = True
-        else:
-            # Fallback to wg-quick (will fail with AWG params!)
-            wg_quick = shutil.which("wg-quick")
-            if wg_quick:
-                self.awg_quick = wg_quick
-                self.is_awg = False
-        
-        # Check for awg show command
-        awg = shutil.which("awg")
-        if awg:
-            self.awg_show = awg
-        else:
-            wg = shutil.which("wg")
-            if wg:
-                self.awg_show = wg
-    
-    def _detect_windows(self):
-        """Detect on Windows"""
-        # Check for AmneziaWG
-        awg_paths = [
-            r"C:\Program Files\AmneziaWG\awg.exe",
-            r"C:\Program Files (x86)\AmneziaWG\awg.exe",
-        ]
-        
-        for path in awg_paths:
-            if os.path.exists(path):
-                self.awg_show = path
-                self.awg_quick = "wireguard"  # Windows uses wireguard.exe for tunnel service
-                self.is_awg = True
-                return
-        
-        # Fallback to standard WireGuard
-        wg_paths = [
-            r"C:\Program Files\WireGuard\wg.exe",
-            r"C:\Program Files (x86)\WireGuard\wg.exe",
-        ]
-        
-        for path in wg_paths:
-            if os.path.exists(path):
-                self.awg_show = path
-                self.awg_quick = "wireguard"
-                self.is_awg = False
-                return
-    
-    def check(self) -> bool:
-        """Check if AmneziaWG is available and print status"""
-        print(f"\n{'='*60}")
-        print("CHECKING AMNEZIAWG INSTALLATION")
-        print(f"{'='*60}")
-        
-        if self.awg_quick:
-            print(f"  awg-quick/wg-quick: {self.awg_quick}")
-        else:
-            print(f"  ❌ awg-quick/wg-quick: NOT FOUND")
-        
-        if self.awg_show:
-            print(f"  awg/wg command: {self.awg_show}")
-        else:
-            print(f"  ❌ awg/wg command: NOT FOUND")
-        
-        if self.is_awg:
-            print(f"\n  ✓ AmneziaWG detected - obfuscation parameters supported")
-            return True
-        else:
-            print(f"\n  ⚠️  WARNING: Only standard WireGuard found!")
-            print(f"  ⚠️  Obfuscation parameters (Jc, Jmin, Jmax, S1, S2, H1-H4)")
-            print(f"  ⚠️  will NOT work with standard WireGuard!")
-            print(f"\n  Please install AmneziaWG:")
-            print(f"    Ubuntu/Debian:")
-            print(f"      sudo add-apt-repository ppa:amnezia/ppa")
-            print(f"      sudo apt update")
-            print(f"      sudo apt install amneziawg amneziawg-tools")
-            print(f"\n    Or build from source:")
-            print(f"      https://github.com/amnezia-vpn/amneziawg-tools")
-            return False
-    
-    def verify_awg_works(self) -> bool:
-        """Verify AWG actually supports obfuscation"""
-        if not self.awg_show:
-            return False
-        
-        try:
-            result = subprocess.run(
-                [self.awg_show, "--help"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            # AWG should show in help or version
-            output = result.stdout + result.stderr
-            return "amnezia" in output.lower() or self.is_awg
-        except:
-            return self.is_awg
+def __init__(self, output_dir: str = "generated_configs"):
+    self.output_dir = Path(output_dir)
+    self.output_dir.mkdir(parents=True, exist_ok=True)
 
+def generate_config_content(self, base_config: WGConfig, junk_params: JunkPacketParams) -> str:
+    """Generate config file content with new junk parameters"""
+    lines = []
 
-# =============================================================================
-# CONFIG TESTER
-# =============================================================================
+    # Interface section
+    lines.append("[Interface]")
+    for line in base_config.interface_lines:
+        lines.append(line)
+
+    # Add junk parameters
+    junk_lines = junk_params.to_config_lines()
+    if junk_lines:
+        lines.append("")  # Empty line before junk params
+        lines.extend(junk_lines)
+
+    # Peer section
+    lines.append("")
+    lines.append("[Peer]")
+    for line in base_config.peer_lines:
+        lines.append(line)
+
+    return '\n'.join(lines)
+
+def generate_variation(
+    self,
+    base_config: WGConfig,
+    junk_params: JunkPacketParams,
+    suffix: str = ""
+) -> str:
+    """Generate a single config variation and save to file"""
+
+    content = self.generate_config_content(base_config, junk_params)
+
+    # Generate filename
+    if suffix:
+        filename = f"{base_config.name}_{suffix}.conf"
+    else:
+        filename = f"{base_config.name}_{junk_params.describe()}.conf"
+
+    filepath = self.output_dir / filename
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    # Set permissions on Linux
+    if platform.system() != "Windows":
+        os.chmod(filepath, 0o600)
+
+    return str(filepath)
+
+def generate_all_variations(self, base_config: WGConfig) -> List[Tuple[str, JunkPacketParams]]:
+    """Generate all test variations for a base config"""
+    variations = []
+
+    print(f"\n  Generating variations for: {base_config.name}")
+
+    # 1. Vary Junk Count with fixed min/max
+    for jc in self.JUNK_COUNT_VALUES:
+        params = JunkPacketParams(Jc=jc, Jmin=40, Jmax=70)
+        filepath = self.generate_variation(base_config, params, f"jc{jc}")
+        variations.append((filepath, params))
+
+    # 2. Vary min/max sizes with fixed count
+    for jmin in self.JUNK_MIN_VALUES:
+        for jmax in self.JUNK_MAX_VALUES:
+            if jmax > jmin:  # Max must be > min
+                params = JunkPacketParams(Jc=5, Jmin=jmin, Jmax=jmax)
+                filepath = self.generate_variation(
+                    base_config, params,
+                    f"jc5_min{jmin}_max{jmax}"
+                )
+                variations.append((filepath, params))
+
+    # 3. Test S1/S2 handshake junk
+    for s1 in self.S1_VALUES:
+        for s2 in self.S2_VALUES:
+            if s1 > 0 or s2 > 0:  # At least one non-zero
+                params = JunkPacketParams(Jc=5, Jmin=40, Jmax=70, S1=s1, S2=s2)
+                filepath = self.generate_variation(
+                    base_config, params,
+                    f"jc5_s1_{s1}_s2_{s2}"
+                )
+                variations.append((filepath, params))
+
+    # 4. Aggressive obfuscation profiles
+    aggressive_profiles = [
+        ("aggressive_low", JunkPacketParams(Jc=10, Jmin=50, Jmax=200, S1=50, S2=50)),
+        ("aggressive_med", JunkPacketParams(Jc=20, Jmin=100, Jmax=400, S1=100, S2=100)),
+        ("aggressive_high", JunkPacketParams(Jc=40, Jmin=150, Jmax=800, S1=200, S2=200)),
+        ("stealth", JunkPacketParams(Jc=3, Jmin=64, Jmax=128, S1=64, S2=64)),
+    ]
+
+    for name, params in aggressive_profiles:
+        filepath = self.generate_variation(base_config, params, name)
+        variations.append((filepath, params))
+
+    print(f"    Generated {len(variations)} variations")
+    return variations
+
+def generate_custom_variation(
+    self,
+    base_config: WGConfig,
+    jc: int,
+    jmin: int,
+    jmax: int,
+    s1: int = 0,
+    s2: int = 0
+) -> Tuple[str, JunkPacketParams]:
+    """Generate a single custom variation"""
+    params = JunkPacketParams(Jc=jc, Jmin=jmin, Jmax=jmax, S1=s1, S2=s2)
+    filepath = self.generate_variation(base_config, params)
+    return filepath, params
+
+=============================================================================
+CONFIG TESTER
+=============================================================================
 
 class ConfigTester:
-    """Test WireGuard configurations"""
-    
-    def __init__(self, interface: str = "awg-test", detector: AWGDetector = None):
-        self.interface = interface
-        self.system = platform.system()
-        self.detector = detector or AWGDetector()
-        self.is_admin = self._check_admin()
-        
-        self.awg_quick = self.detector.awg_quick
-        self.awg_show = self.detector.awg_show
-    
-    def _check_admin(self) -> bool:
-        if self.system == "Windows":
-            try:
-                import ctypes
-                return ctypes.windll.shell32.IsUserAnAdmin() != 0
-            except:
-                return False
-        return os.geteuid() == 0
-    
-    def _run(self, cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
+"""Test WireGuard configurations"""
+
+text
+
+def __init__(self, interface_name: str = "wg-test"):
+    self.interface_name = interface_name
+    self.system = platform.system()
+    self.is_admin = self._check_admin()
+    self.wg_cmd = self._find_wg_command()
+    self.wg_quick_cmd = self._find_wg_quick_command()
+    self.results: List[TestResult] = []
+
+def _check_admin(self) -> bool:
+    """Check for admin/root privileges"""
+    if self.system == "Windows":
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            return -1, "", "Timeout"
-        except Exception as e:
-            return -1, "", str(e)
-    
-    def _up(self, config_path: str) -> Tuple[bool, str]:
-        """Bring up interface"""
-        config_name = Path(config_path).stem
-        
-        try:
-            if self.system == "Windows":
-                # Windows with AmneziaWG
-                self._run(["wireguard", "/uninstalltunnelservice", config_name], 10)
-                time.sleep(1)
-                
-                # For AmneziaWG on Windows, use the AmneziaWG service
-                if self.detector.is_awg:
-                    code, out, err = self._run(
-                        ["wireguard", "/installtunnelservice", config_path], 30
-                    )
-                else:
-                    code, out, err = self._run(
-                        ["wireguard", "/installtunnelservice", config_path], 30
-                    )
-                
-                if code != 0:
-                    return False, f"Install failed: {err}"
-            else:
-                # Linux
-                # Bring down existing
-                self._run([self.awg_quick, "down", self.interface], 10)
-                time.sleep(1)
-                
-                # Copy config to /etc/wireguard (or /etc/amnezia/amneziawg)
-                if self.detector.is_awg:
-                    # Try AmneziaWG config directory first
-                    target_dirs = [
-                        f"/etc/amnezia/amneziawg/{self.interface}.conf",
-                        f"/etc/wireguard/{self.interface}.conf"
-                    ]
-                else:
-                    target_dirs = [f"/etc/wireguard/{self.interface}.conf"]
-                
-                target = target_dirs[0]
-                
-                # Create directory if needed
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                
-                shutil.copy(config_path, target)
-                os.chmod(target, 0o600)
-                
-                # Bring up
-                code, out, err = self._run([self.awg_quick, "up", self.interface], 30)
-                
-                if code != 0:
-                    # Full error output for debugging
-                    full_error = f"{out}\n{err}".strip()
-                    return False, full_error
-            
-            time.sleep(3)  # Wait for handshake
-            return True, ""
-            
-        except Exception as e:
-            return False, str(e)
-    
-    def _down(self, config_path: str = None):
-        """Bring down interface"""
-        try:
-            if self.system == "Windows" and config_path:
-                config_name = Path(config_path).stem
-                self._run(["wireguard", "/uninstalltunnelservice", config_name], 10)
-            else:
-                self._run([self.awg_quick, "down", self.interface], 10)
-                
-                # Cleanup config files
-                for target in [
-                    f"/etc/wireguard/{self.interface}.conf",
-                    f"/etc/amnezia/amneziawg/{self.interface}.conf"
-                ]:
-                    if os.path.exists(target):
-                        os.remove(target)
-        except:
-            pass
-    
-    def _check_handshake(self) -> bool:
-        """Check if handshake completed"""
-        try:
-            if self.system == "Windows":
-                code, out, _ = self._run([self.awg_show, "show"], 5)
-            else:
-                code, out, _ = self._run([self.awg_show, "show", self.interface], 5)
-            return "latest handshake" in out.lower()
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
         except:
             return False
-    
-    def _ping_test(self, target: str, count: int) -> Tuple[List[float], float]:
-        """Run ping test"""
+    return os.geteuid() == 0
+
+def _find_wg_command(self) -> str:
+    """Find WireGuard command"""
+    if self.system == "Windows":
+        candidates = [
+            r"C:\Program Files\WireGuard\wg.exe",
+            r"C:\Program Files\AmneziaWG\awg.exe",
+            "wg", "awg"
+        ]
+    else:
+        candidates = ["awg", "wg"]
+
+    for cmd in candidates:
         try:
-            if self.system == "Windows":
-                cmd = ["ping", "-n", str(count), target]
-            else:
-                cmd = ["ping", "-c", str(count), "-W", "2", target]
-            
-            code, out, _ = self._run(cmd, count * 3 + 10)
-            
-            times = []
-            for line in out.split('\n'):
-                match = re.search(r'time[=<](\d+\.?\d*)', line.lower())
-                if match:
-                    times.append(float(match.group(1)))
-            
-            loss = ((count - len(times)) / count) * 100 if count > 0 else 100
-            return times, loss
-            
+            if os.path.isfile(cmd) or shutil.which(cmd):
+                return cmd
         except:
-            return [], 100.0
-    
-    def test(
-        self,
-        config_path: str,
-        params: AWGParams,
-        ping_target: str = "1.1.1.1",
-        ping_count: int = 5
-    ) -> TestResult:
-        """Test a single configuration"""
-        
-        result = TestResult(
-            config_name=Path(config_path).stem,
-            params=params.to_dict(),
-            timestamp=datetime.now().isoformat()
+            pass
+    return "wg"
+
+def _find_wg_quick_command(self) -> str:
+    """Find wg-quick command"""
+    if self.system == "Windows":
+        return "wireguard"
+
+    for cmd in ["awg-quick", "wg-quick"]:
+        if shutil.which(cmd):
+            return cmd
+    return "wg-quick"
+
+def _run_command(self, cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
+    """Run a command and return (returncode, stdout, stderr)"""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
         )
-        
-        success, error = self._up(config_path)
-        if not success:
-            result.error = error
-            self._down(config_path)
-            return result
-        
-        result.success = True
-        result.handshake_ok = self._check_handshake()
-        
-        if result.handshake_ok:
-            times, loss = self._ping_test(ping_target, ping_count)
-            result.packet_loss = loss
-            if times:
-                result.ping_avg_ms = statistics.mean(times)
-                result.ping_min_ms = min(times)
-                result.ping_max_ms = max(times)
-        
-        self._down(config_path)
-        time.sleep(2)
-        
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "Timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+def bring_up(self, config_path: str) -> Tuple[bool, float, str]:
+    """Bring up WireGuard interface"""
+    start_time = time.time()
+    config_name = Path(config_path).stem
+
+    try:
+        if self.system == "Windows":
+            # Remove existing tunnel
+            self._run_command(
+                ["wireguard", "/uninstalltunnelservice", config_name],
+                timeout=10
+            )
+            time.sleep(1)
+
+            # Install tunnel service
+            code, out, err = self._run_command(
+                ["wireguard", "/installtunnelservice", config_path],
+                timeout=30
+            )
+
+            if code != 0:
+                return False, 0, f"Install failed: {err}"
+
+        else:
+            # Linux - copy config to /etc/wireguard
+            target_conf = f"/etc/wireguard/{self.interface_name}.conf"
+
+            # Bring down if exists
+            self._run_command([self.wg_quick_cmd, "down", self.interface_name], timeout=10)
+            time.sleep(1)
+
+            # Copy config
+            shutil.copy(config_path, target_conf)
+            os.chmod(target_conf, 0o600)
+
+            # Bring up
+            code, out, err = self._run_command(
+                [self.wg_quick_cmd, "up", self.interface_name],
+                timeout=30
+            )
+
+            if code != 0:
+                return False, 0, f"Up failed: {err}"
+
+        elapsed = (time.time() - start_time) * 1000
+        time.sleep(2)  # Wait for handshake
+
+        return True, elapsed, ""
+
+    except Exception as e:
+        return False, 0, str(e)
+
+def bring_down(self, config_path: str = None):
+    """Bring down WireGuard interface"""
+    try:
+        if self.system == "Windows":
+            if config_path:
+                config_name = Path(config_path).stem
+                self._run_command(
+                    ["wireguard", "/uninstalltunnelservice", config_name],
+                    timeout=10
+                )
+        else:
+            self._run_command(
+                [self.wg_quick_cmd, "down", self.interface_name],
+                timeout=10
+            )
+            # Cleanup
+            target_conf = f"/etc/wireguard/{self.interface_name}.conf"
+            if os.path.exists(target_conf):
+                os.remove(target_conf)
+    except:
+        pass
+
+def check_handshake(self) -> bool:
+    """Check if handshake completed"""
+    try:
+        if self.system == "Windows":
+            code, out, err = self._run_command([self.wg_cmd, "show"], timeout=5)
+        else:
+            code, out, err = self._run_command(
+                [self.wg_cmd, "show", self.interface_name],
+                timeout=5
+            )
+        return "latest handshake" in out.lower()
+    except:
+        return False
+
+def run_ping_test(self, target: str = "1.1.1.1", count: int = 10) -> Tuple[List[float], float]:
+    """Run ping test and return (ping_times, packet_loss_pct)"""
+    try:
+        if self.system == "Windows":
+            cmd = ["ping", "-n", str(count), target]
+        else:
+            cmd = ["ping", "-c", str(count), "-W", "2", target]
+
+        code, out, err = self._run_command(cmd, timeout=count * 3 + 10)
+
+        # Parse ping times
+        ping_times = []
+        for line in out.split('\n'):
+            if "time=" in line.lower():
+                try:
+                    # Extract time value
+                    match = re.search(r'time[=<](\d+\.?\d*)', line.lower())
+                    if match:
+                        ping_times.append(float(match.group(1)))
+                except:
+                    pass
+
+        # Calculate packet loss
+        if ping_times:
+            packet_loss = ((count - len(ping_times)) / count) * 100
+        else:
+            packet_loss = 100.0
+
+        return ping_times, packet_loss
+
+    except Exception as e:
+        return [], 100.0
+
+def test_config(
+    self,
+    config_path: str,
+    junk_params: JunkPacketParams = None,
+    ping_target: str = "1.1.1.1",
+    ping_count: int = 10
+) -> TestResult:
+    """Test a single configuration"""
+
+    config_name = Path(config_path).stem
+    result = TestResult(
+        config_name=config_name,
+        config_path=config_path,
+        junk_params=junk_params.to_dict() if junk_params else {},
+        timestamp=datetime.now().isoformat()
+    )
+
+    print(f"\n  Testing: {config_name}")
+    if junk_params:
+        print(f"    Params: Jc={junk_params.Jc}, Jmin={junk_params.Jmin}, "
+              f"Jmax={junk_params.Jmax}, S1={junk_params.S1}, S2={junk_params.S2}")
+
+    # Bring up interface
+    success, elapsed, error = self.bring_up(config_path)
+    result.handshake_time_ms = elapsed
+
+    if not success:
+        result.errors.append(error)
+        print(f"    ❌ Failed to connect: {error}")
+        self.bring_down(config_path)
+        self.results.append(result)
         return result
 
+    result.success = True
 
-# =============================================================================
-# MAIN TESTER APPLICATION
-# =============================================================================
+    # Check handshake
+    result.handshake_ok = self.check_handshake()
+    if result.handshake_ok:
+        print(f"    ✓ Handshake OK ({elapsed:.0f}ms)")
+    else:
+        print(f"    ⚠ No handshake detected")
 
-class AWGTester:
-    """Main application"""
-    
-    def __init__(self, args):
-        self.args = args
-        self.config_dir = Path(args.config_dir)
-        self.output_dir = Path(args.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.generated_dir = self.output_dir / "generated"
-        self.results_dir = self.output_dir / "results"
-        self.generated_dir.mkdir(exist_ok=True)
-        self.results_dir.mkdir(exist_ok=True)
-        
-        self.configs: List[WGConfig] = []
-        self.variations: List[Tuple[str, AWGParams]] = []
-        self.results: List[TestResult] = []
-        
-        # Detector
-        self.detector = AWGDetector()
-        
-        # Parse parameter values
-        self.jc_values = self._parse_values(args.jc_values, args.jc_range, [0, 3, 5, 10])
-        self.jmin_values = self._parse_values(args.jmin_values, args.jmin_range, [40, 50])
-        self.jmax_values = self._parse_values(args.jmax_values, args.jmax_range, [70, 100, 150])
-        self.s1_values = self._parse_values(args.s1_values, args.s1_range, [0, 50])
-        self.s2_values = self._parse_values(args.s2_values, args.s2_range, [0, 50])
-        
-        # H1-H4 values
-        self.h1 = args.h1
-        self.h2 = args.h2
-        self.h3 = args.h3
-        self.h4 = args.h4
-    
-    def _parse_values(
-        self,
-        values_str: Optional[str],
-        range_args: Optional[List[int]],
-        default: List[int]
-    ) -> List[int]:
-        if values_str:
-            return [int(x.strip()) for x in values_str.split(',')]
-        if range_args:
-            start, end, step = range_args
-            return list(range(start, end + 1, step))
-        return default
-    
-    def check_environment(self) -> bool:
-        """Check if environment is ready"""
-        if not self.detector.check():
-            if not self.args.generate_only and not self.args.force:
-                print(f"\n❌ Cannot proceed without AmneziaWG for testing.")
-                print(f"   Use --generate-only to just generate configs")
-                print(f"   Use --force to try anyway (will likely fail)")
-                return False
-        return True
-    
-    def load_configs(self) -> int:
-        print(f"\n{'='*60}")
-        print(f"LOADING CONFIGS FROM: {self.config_dir}")
-        print(f"{'='*60}\n")
-        
-        self.configs = ConfigParser.parse_directory(str(self.config_dir))
-        print(f"\nLoaded: {len(self.configs)} configurations")
-        return len(self.configs)
-    
-    def generate_variations(self) -> int:
-        print(f"\n{'='*60}")
-        print("GENERATING VARIATIONS")
-        print(f"{'='*60}")
-        print(f"\nParameters to test:")
-        print(f"  Jc:   {self.jc_values}")
-        print(f"  Jmin: {self.jmin_values}")
-        print(f"  Jmax: {self.jmax_values}")
-        print(f"  S1:   {self.s1_values}")
-        print(f"  S2:   {self.s2_values}")
-        print(f"\nFixed headers:")
-        print(f"  H1={self.h1}, H2={self.h2}, H3={self.h3}, H4={self.h4}")
-        
-        generator = ConfigGenerator(str(self.generated_dir))
-        self.variations = []
-        
-        for config in self.configs:
-            print(f"\n  Generating for: {config.name}")
-            
-            variations = generator.generate_variations(
-                config,
-                self.jc_values,
-                self.jmin_values,
-                self.jmax_values,
-                self.s1_values,
-                self.s2_values,
-                self.h1, self.h2, self.h3, self.h4
-            )
-            
-            self.variations.extend(variations)
-            print(f"    Created {len(variations)} variations")
-        
-        print(f"\nTotal variations: {len(self.variations)}")
-        return len(self.variations)
-    
-    def run_tests(self) -> int:
-        tester = ConfigTester(detector=self.detector)
-        
-        if not tester.is_admin:
-            print("\n❌ Administrator/root privileges required!")
-            print("   Linux:   sudo python3 awg_tester.py ...")
-            print("   Windows: Run as Administrator")
-            return 0
-        
-        print(f"\n{'='*60}")
-        print(f"TESTING {len(self.variations)} CONFIGURATIONS")
-        print(f"{'='*60}")
-        print(f"\nUsing: {self.detector.awg_quick}")
-        print(f"Is AmneziaWG: {self.detector.is_awg}")
-        
-        for i, (config_path, params) in enumerate(self.variations, 1):
-            name = Path(config_path).stem
-            print(f"\n[{i}/{len(self.variations)}] {name}")
-            print(f"  Jc={params.Jc}, Jmin={params.Jmin}, Jmax={params.Jmax}, "
-                  f"S1={params.S1}, S2={params.S2}")
-            
-            result = tester.test(
-                config_path, params,
-                self.args.ping_target,
-                self.args.ping_count
-            )
-            self.results.append(result)
-            
-            if result.handshake_ok:
-                print(f"  ✓ Handshake OK | Ping: {result.ping_avg_ms:.1f}ms | "
-                      f"Loss: {result.packet_loss:.0f}%")
-            elif result.success:
-                print(f"  ⚠ Connected but no handshake")
-            else:
-                # Truncate long errors
-                error_short = result.error[:100] + "..." if len(result.error) > 100 else result.error
-                print(f"  ✗ Failed: {error_short}")
-                
-                # Check for the specific AWG error
-                if "Line unrecognized" in result.error or "Jc" in result.error:
-                    print(f"  ⚠ This error means standard WireGuard is being used!")
-                    print(f"  ⚠ Please install AmneziaWG (awg-quick, awg)")
-                    if not self.args.force:
-                        print(f"\n  Stopping tests. Use --force to continue anyway.")
-                        break
-        
-        return len(self.results)
-    
-    def save_results(self):
-        if not self.results:
-            print("\nNo results to save")
-            return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # JSON
-        json_path = self.results_dir / f"results_{timestamp}.json"
-        with open(json_path, 'w') as f:
-            json.dump([{
-                'name': r.config_name,
-                'params': r.params,
-                'success': r.success,
-                'handshake': r.handshake_ok,
-                'ping_avg': r.ping_avg_ms,
-                'ping_min': r.ping_min_ms,
-                'ping_max': r.ping_max_ms,
-                'loss': r.packet_loss,
-                'error': r.error
-            } for r in self.results], f, indent=2)
-        
-        # CSV
-        csv_path = self.results_dir / f"results_{timestamp}.csv"
-        with open(csv_path, 'w') as f:
-            f.write("Config,Jc,Jmin,Jmax,S1,S2,H1,H2,H3,H4,"
-                   "Success,Handshake,Ping_Avg,Ping_Min,Ping_Max,Loss,Error\n")
-            for r in self.results:
-                p = r.params
-                error_clean = r.error.replace(',', ';').replace('\n', ' ')[:50]
-                f.write(f"{r.config_name},{p['Jc']},{p['Jmin']},{p['Jmax']},"
-                       f"{p['S1']},{p['S2']},{p['H1']},{p['H2']},{p['H3']},{p['H4']},"
-                       f"{r.success},{r.handshake_ok},{r.ping_avg_ms:.1f},"
-                       f"{r.ping_min_ms:.1f},{r.ping_max_ms:.1f},{r.packet_loss:.1f},"
-                       f"\"{error_clean}\"\n")
-        
-        print(f"\n{'='*60}")
-        print("RESULTS SAVED")
-        print(f"{'='*60}")
-        print(f"  JSON: {json_path}")
-        print(f"  CSV:  {csv_path}")
-        
-        self._print_summary()
-    
-    def _print_summary(self):
-        print(f"\n{'='*70}")
-        print("SUMMARY")
-        print(f"{'='*70}")
-        
-        successful = [r for r in self.results if r.handshake_ok]
-        failed = [r for r in self.results if not r.handshake_ok]
-        
-        print(f"\nTotal: {len(self.results)} | Success: {len(successful)} | Failed: {len(failed)}")
-        
-        # Check for AWG-specific errors
-        awg_errors = [r for r in failed if "Line unrecognized" in r.error or "Jc" in r.error]
-        if awg_errors:
-            print(f"\n⚠️  {len(awg_errors)} tests failed due to missing AmneziaWG!")
-            print(f"   Standard WireGuard cannot parse AWG parameters.")
-        
-        if successful:
-            successful.sort(key=lambda x: x.ping_avg_ms if x.ping_avg_ms > 0 else 9999)
-            
-            print(f"\n{'─'*70}")
-            print(f"{'Jc':<4} {'Jmin':<5} {'Jmax':<5} {'S1':<4} {'S2':<4} "
-                  f"{'Ping Avg':<10} {'Loss%':<8} Config")
-            print(f"{'─'*70}")
-            
-            for r in successful[:20]:
-                p = r.params
-                print(f"{p['Jc']:<4} {p['Jmin']:<5} {p['Jmax']:<5} "
-                      f"{p['S1']:<4} {p['S2']:<4} "
-                      f"{r.ping_avg_ms:<10.1f} {r.packet_loss:<8.1f} {r.config_name[:30]}")
-            
-            best = successful[0]
-            p = best.params
-            print(f"\n{'─'*70}")
-            print(f"🏆 BEST: Jc={p['Jc']}, Jmin={p['Jmin']}, Jmax={p['Jmax']}, "
-                  f"S1={p['S1']}, S2={p['S2']}")
-            print(f"   H1={p['H1']}, H2={p['H2']}, H3={p['H3']}, H4={p['H4']}")
-            print(f"   Ping: {best.ping_avg_ms:.1f}ms, Loss: {best.packet_loss:.0f}%")
-            
-            self._generate_recommended(best)
-    
-    def _generate_recommended(self, best: TestResult):
-        if not self.configs:
-            return
-        
-        params = AWGParams(**best.params)
-        generator = ConfigGenerator(str(self.output_dir))
-        
-        print(f"\n{'─'*70}")
-        print("RECOMMENDED CONFIGURATIONS:")
-        
-        for config in self.configs:
-            filepath = generator.generate(config, params, "RECOMMENDED")
-            print(f"\n  📄 {filepath}")
-            
-            with open(filepath, 'r') as f:
-                print(f"\n  {'─'*40}")
-                for line in f:
-                    print(f"  {line.rstrip()}")
-                print(f"  {'─'*40}")
-    
-    def run(self):
-        """Main execution"""
-        if not self.check_environment():
-            sys.exit(1)
-        
-        if self.load_configs() == 0:
-            print(f"\n❌ No .conf files found in {self.config_dir}")
-            sys.exit(1)
-        
-        if self.generate_variations() == 0:
-            print("\n❌ No variations generated")
-            sys.exit(1)
-        
-        if self.args.generate_only:
-            print(f"\n✓ Generated {len(self.variations)} configs in {self.generated_dir}")
-            return
-        
-        self.run_tests()
-        self.save_results()
+    # Run ping test
+    ping_times, packet_loss = self.run_ping_test(ping_target, ping_count)
+    result.ping_times = ping_times
+    result.packet_loss_pct = packet_loss
 
+    if ping_times:
+        result.ping_avg_ms = statistics.mean(ping_times)
+        result.ping_min_ms = min(ping_times)
+        result.ping_max_ms = max(ping_times)
+        print(f"    ✓ Ping: avg={result.ping_avg_ms:.1f}ms, "
+              f"min={result.ping_min_ms:.1f}ms, max={result.ping_max_ms:.1f}ms, "
+              f"loss={packet_loss:.0f}%")
+    else:
+        print(f"    ❌ Ping failed (100% loss)")
 
-# =============================================================================
-# MAIN
-# =============================================================================
+    # Bring down interface
+    self.bring_down(config_path)
+    time.sleep(2)  # Cooldown between tests
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="AmneziaWG Configuration Tester (requires AmneziaWG, not standard WireGuard)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-IMPORTANT: This tool requires AmneziaWG, not standard WireGuard!
+    self.results.append(result)
+    return result
 
-Install AmneziaWG on Ubuntu/Debian:
-  sudo add-apt-repository ppa:amnezia/ppa
-  sudo apt update
-  sudo apt install amneziawg amneziawg-tools
+def test_all(
+    self,
+    config_variations: List[Tuple[str, JunkPacketParams]],
+    ping_target: str = "1.1.1.1",
+    ping_count: int = 10
+) -> List[TestResult]:
+    """Test all configuration variations"""
 
-Examples:
-  # Basic test
-  sudo python3 awg_tester.py -c ./conf
-  
-  # Set H1-H4 (must match server!)
-  sudo python3 awg_tester.py -c ./conf --h1 123456789 --h2 987654321 --h3 111111 --h4 222222
-  
-  # Specific Jc values
-  sudo python3 awg_tester.py -c ./conf --jc-values 1,3,5,10,15
-  
-  # Generate configs only
-  python3 awg_tester.py -c ./conf --generate-only
-        """
-    )
-    
-    # Directories
-    parser.add_argument('-c', '--config-dir', default='conf',
-                       help='Directory with .conf files')
-    parser.add_argument('-o', '--output-dir', default='output',
-                       help='Output directory')
-    
-    # H1-H4
-    parser.add_argument('--h1', type=int, default=1, help='H1 header')
-    parser.add_argument('--h2', type=int, default=2, help='H2 header')
-    parser.add_argument('--h3', type=int, default=3, help='H3 header')
-    parser.add_argument('--h4', type=int, default=4, help='H4 header')
-    
-    # Parameter values
-    parser.add_argument('--jc-values', help='Jc values (comma-separated)')
-    parser.add_argument('--jc-range', type=int, nargs=3, metavar=('START', 'END', 'STEP'))
-    parser.add_argument('--jmin-values', help='Jmin values')
-    parser.add_argument('--jmin-range', type=int, nargs=3, metavar=('START', 'END', 'STEP'))
-    parser.add_argument('--jmax-values', help='Jmax values')
-    parser.add_argument('--jmax-range', type=int, nargs=3, metavar=('START', 'END', 'STEP'))
-    parser.add_argument('--s1-values', help='S1 values')
-    parser.add_argument('--s1-range', type=int, nargs=3, metavar=('START', 'END', 'STEP'))
-    parser.add_argument('--s2-values', help='S2 values')
-    parser.add_argument('--s2-range', type=int, nargs=3, metavar=('START', 'END', 'STEP'))
-    
-    # Test options
-    parser.add_argument('--ping-target', default='1.1.1.1', help='Ping target')
-    parser.add_argument('--ping-count', type=int, default=5, help='Ping count')
-    parser.add_argument('--generate-only', action='store_true', help='Only generate configs')
-    parser.add_argument('--force', action='store_true', 
-                       help='Force testing even without AmneziaWG (will likely fail)')
-    
-    args = parser.parse_args()
-    
-    print("""
-╔══════════════════════════════════════════════════════════════════╗
-║          AmneziaWG Configuration Tester                          ║
-║   Requires: awg-quick, awg (AmneziaWG tools)                     ║
-║   NOT compatible with standard wg-quick/wg                       ║
-╚══════════════════════════════════════════════════════════════════╝
-    """)
-    
-    print(f"Platform: {platform.system()}")
-    print(f"Config dir: {args.config_dir}")
-    print(f"H values: H1={args.h1}, H2={args.h2}, H3={args.h3}, H4={args.h4}")
-    
-    app = AWGTester(args)
-    app.run()
-    
     print(f"\n{'='*60}")
-    print("DONE!")
+    print(f"TESTING {len(config_variations)} CONFIGURATIONS")
     print(f"{'='*60}")
 
+    for i, (config_path, junk_params) in enumerate(config_variations, 1):
+        print(f"\n[{i}/{len(config_variations)}]", end="")
+        self.test_config(config_path, junk_params, ping_target, ping_count)
 
-if __name__ == "__main__":
-    main()
+    return self.results
+
+=============================================================================
+RESULTS ANALYZER
+=============================================================================
+
+class ResultsAnalyzer:
+"""Analyze and report test results"""
+
+text
+
+def __init__(self, results: List[TestResult]):
+    self.results = results
+
+def save_json(self, filepath: str):
+    """Save results to JSON"""
+    data = [r.to_dict() for r in self.results]
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    print(f"\nResults saved to: {filepath}")
+
+def save_csv(self, filepath: str):
+    """Save results to CSV"""
+    with open(filepath, 'w', encoding='utf-8') as f:
+        # Header
+        f.write("Config,Jc,Jmin,Jmax,S1,S2,Success,Handshake_OK,"
+               "Handshake_ms,Ping_Avg_ms,Ping_Min_ms,Ping_Max_ms,Loss_Pct\n")
+
+        for r in self.results:
+            jp = r.junk_params
+            f.write(f"{r.config_name},{jp.get('Jc',0)},{jp.get('Jmin',0)},"
+                   f"{jp.get('Jmax',0)},{jp.get('S1',0)},{jp.get('S2',0)},"
+                   f"{r.success},{r.handshake_ok},{r.handshake_time_ms:.1f},"
+                   f"{r.ping_avg_ms:.1f},{r.ping_min_ms:.1f},{r.ping_max_ms:.1f},"
+                   f"{r.packet_loss_pct:.1f}\n")
+
+    print(f"CSV saved to: {filepath}")
+
+def print_summary(self):
+    """Print results summary"""
+    print(f"\n{'='*70}")
+    print("TEST RESULTS SUMMARY")
+    print(f"{'='*70}")
+
+    successful = [r for r in self.results if r.success and r.handshake_ok]
+    failed = [r for r in self.results if not r.success or not r.handshake_ok]
+
+    print(f"\nTotal: {len(self.results)} | "
+          f"Success: {len(successful)} | Failed: {len(failed)}")
+
+    if successful:
+        print(f"\n{'─'*70}")
+        print(f"{'Config':<30} {'Jc':<5} {'Min':<5} {'Max':<5} "
+              f"{'Ping(ms)':<10} {'Loss%':<8}")
+        print(f"{'─'*70}")
+
+        # Sort by ping avg
+        for r in sorted(successful, key=lambda x: x.ping_avg_ms if x.ping_avg_ms > 0 else 9999):
+            jp = r.junk_params
+            name = r.config_name[:28]
+            print(f"{name:<30} {jp.get('Jc',0):<5} {jp.get('Jmin',0):<5} "
+                  f"{jp.get('Jmax',0):<5} {r.ping_avg_ms:<10.1f} {r.packet_loss_pct:<8.1f}")
+
+    # Best configuration
+    if successful:
+        best = min(successful, key=lambda x: x.ping_avg_ms if x.ping_avg_ms > 0 else 9999)
+        print(f"\n{'─'*70}")
+        print(f"🏆 BEST CONFIGURATION: {best.config_name}")
+        print(f"   Jc={best.junk_params.get('Jc',0)}, "
+              f"Jmin={best.junk_params.get('Jmin',0)}, "
+              f"Jmax={best.junk_params.get('Jmax',0)}")
+        print(f"   Ping: {best.ping_avg_ms:.1f}ms avg, {best.packet_loss_pct:.1f}% loss")
+
+    # Failed configs
+    if failed:
+        print(f"\n{'─'*70}")
+        print("FAILED CONFIGURATIONS:")
+        for r in failed[:10]:  # Show first 10
+            print(f"  ❌ {r.config_name}: {', '.join(r.errors) if r.errors else 'No handshake'}")
+
+def get_best_params(self) -> Optional[JunkPacketParams]:
+    """Get the best performing junk parameters"""
+    successful = [r for r in self.results if r.success and r.handshake_ok and r.ping_avg_ms > 0]
+    if not successful:
+        return None
+
+    best = min(successful, key=lambda x: x.ping_avg_ms)
+    jp = best.junk_params
+
+    return JunkPacketParams(
+        Jc=jp.get('Jc', 0),
+        Jmin=jp.get('Jmin', 40),
+        Jmax=jp.get('Jmax', 70),
+        S1=jp.get('S1', 0),
+        S2=jp.get('S2', 0)
+    )
+
+=============================================================================
+MAIN APPLICATION
+=============================================================================
+
+class WGJunkTester:
+"""Main application class"""
+
+text
+
+def __init__(self, config_dir: str, output_dir: str = "output"):
+    self.config_dir = Path(config_dir)
+    self.output_dir = Path(output_dir)
+    self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    self.generated_dir = self.output_dir / "generated_configs"
+    self.results_dir = self.output_dir / "results"
+    self.results_dir.mkdir(parents=True, exist_ok=True)
+
+    self.base_configs: List[WGConfig] = []
+    self.variations: List[Tuple[str, JunkPacketParams]] = []
+    self.results: List[TestResult] = []
+
+def load_configs(self) -> int:
+    """Load configurations from config directory"""
+    print(f"\n{'='*60}")
+    print(f"LOADING CONFIGURATIONS FROM: {self.config_dir}")
+    print(f"{'='*60}")
+
+    self.base_configs = ConfigParser.parse_directory(str(self.config_dir))
+
+    print(f"\nLoaded {len(self.base_configs)} configurations")
+
+    for config in self.base_configs:
+        print(f"\n  📄 {config.name}")
+        print(f"     Endpoint: {config.endpoint}")
+        print(f"     Current Junk: Jc={config.junk_params.Jc}, "
+              f"Jmin={config.junk_params.Jmin}, Jmax={config.junk_params.Jmax}")
+
+    return len(self.base_configs)
+
+def generate_variations(self, custom_only: bool = False,
+                       jc: int = None, jmin: int = None, jmax: int = None) -> int:
+    """Generate configuration variations"""
+    print(f"\n{'='*60}")
+    print("GENERATING CONFIGURATION VARIATIONS")
+    print(f"{'='*60}")
+
+    generator = ConfigGenerator(str(self.generated_dir))
+    self.variations = []
+
+    for base_config in self.base_configs:
+        if custom_only and jc is not None:
+            # Generate single custom variation
+            filepath, params = generator.generate_custom_variation(
+                base_config,
+                jc=jc,
+                jmin=jmin or 40,
+                jmax=jmax or 70
+            )
+            self.variations.append((filepath, params))
+            print(f"  Generated custom: {Path(filepath).name}")
+        else:
+            # Generate all variations
+            variations = generator.generate_all_variations(base_config)
+            self.variations.extend(variations)
+
+    print(f"\nGenerated {len(self.variations)} total variations")
+    return len(self.variations)
+
+def run_tests(self, ping_target: str = "1.1.1.1", ping_count: int = 10) -> int:
+    """Run tests on all variations"""
+    tester = ConfigTester()
+
+    if not tester.is_admin:
+        print("\n❌ ERROR: Administrator/root privileges required!")
+        print("   Linux: sudo python3 wg_junk_tester.py ...")
+        print("   Windows: Run as Administrator")
+        return 0
+
+    # Also test original configs
+    original_variations = []
+    for config in self.base_configs:
+        original_variations.append((config.filepath, config.junk_params))
+
+    all_variations = original_variations + self.variations
+
+    self.results = tester.test_all(all_variations, ping_target, ping_count)
+    return len(self.results)
+
+def analyze_and_save(self):
+    """Analyze results and save reports"""
+    if not self.results:
+        print("\nNo results to analyze")
+        return
+
+    analyzer = ResultsAnalyzer(self.results)
+
+    # Save results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    analyzer.save_json(str(self.results_dir / f"results_{timestamp}.json"))
+    analyzer.save_csv(str(self.results_dir / f"results_{timestamp}.csv"))
+
+    # Print summary
+    analyzer.print_summary()
+
+    # Get best params and generate recommended config
+    best_params = analyzer.get_best_params()
+    if best_params and self.base_configs:
+        print(f"\n{'='*60}")
+        print("RECOMMENDED CONFIGURATION")
+        print(f"{'='*60}")
+
+        generator = ConfigGenerator(str(self.output_dir))
+        for base_config in self.base_configs:
+            filepath = generator.generate_variation(
+                base_config,
+                best_params,
+                "RECOMMENDED"
+            )
+            print(f"\n  📄 {filepath}")
+            print(f"\n  Content:")
+            with open(filepath, 'r') as f:
+                print(f"  {'-'*40}")
+                for line in f:
+                    print(f"  {line.rstrip()}")
+                print(f"  {'-'*40}")
+
+def main():
+parser = argparse.ArgumentParser(
+description="WireGuard Configuration Tester with Junk Packet Variations",
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog="""
+Examples:
+Test all variations of configs in ./conf directory
+
+sudo python3 wg_junk_tester.py --config-dir ./conf
+Generate and test only, no actual connection tests
+
+python3 wg_junk_tester.py --config-dir ./conf --generate-only
+Test specific junk parameters
+
+sudo python3 wg_junk_tester.py --config-dir ./conf --jc 10 --jmin 50 --jmax 200
+Custom ping target and count
+
+sudo python3 wg_junk_tester.py --config-dir ./conf --ping-target 8.8.8.8 --ping-count 20
+"""
+)
+
+text
+
+parser.add_argument('--config-dir', '-c', default='conf',
+                   help='Directory containing WireGuard .conf files (default: conf)')
+parser.add_argument('--output-dir', '-o', default='output',
+                   help='Output directory for generated configs and results (default: output)')
+parser.add_argument('--ping-target', default='1.1.1.1',
+                   help='IP address to ping for connectivity test (default: 1.1.1.1)')
+parser.add_argument('--ping-count', type=int, default=10,
+                   help='Number of pings per test (default: 10)')
+parser.add_argument('--generate-only', action='store_true',
+                   help='Only generate configs, do not test')
+parser.add_argument('--test-original', action='store_true',
+                   help='Only test original configs without generating variations')
+
+# Custom junk parameters
+parser.add_argument('--jc', type=int, help='Custom Junk packet count')
+parser.add_argument('--jmin', type=int, help='Custom Junk packet min size')
+parser.add_argument('--jmax', type=int, help='Custom Junk packet max size')
+parser.add_argument('--s1', type=int, default=0, help='Custom S1 (init junk size)')
+parser.add_argument('--s2', type=int, default=0, help='Custom S2 (response junk size)')
+
+args = parser.parse_args()
+
+# Print header
+print("""
+
+╔══════════════════════════════════════════════════════════════╗
+║ WireGuard Junk Packet Configuration Tester ║
+║ Supports: AmneziaWG / WireGuard with obfuscation ║
+╚══════════════════════════════════════════════════════════════╝
+""")
+print(f"Platform: {platform.system()} {platform.release()}")
+print(f"Config Directory: {args.config_dir}")
+print(f"Output Directory: {args.output_dir}")
+
+text
+
+# Create main application
+app = WGJunkTester(args.config_dir, args.output_dir)
+
+# Load configs
+if app.load_configs() == 0:
+    print("\n❌ No configurations found!")
+    print(f"   Please place .conf files in: {args.config_dir}")
+    sys.exit(1)
+
+# Test original only
+if args.test_original:
+    app.run_tests(args.ping_target, args.ping_count)
+    app.analyze_and_save()
+    sys.exit(0)
+
+# Generate variations
+custom_only = args.jc is not None
+app.generate_variations(
+    custom_only=custom_only,
+    jc=args.jc,
+    jmin=args.jmin,
+    jmax=args.jmax
+)
+
+if args.generate_only:
+    print("\n✓ Configurations generated (--generate-only specified)")
+    print(f"  Output: {app.generated_dir}")
+    sys.exit(0)
+
+# Run tests
+app.run_tests(args.ping_target, args.ping_count)
+
+# Analyze and save
+app.analyze_and_save()
+
+print(f"\n{'='*60}")
+print("COMPLETE!")
+print(f"{'='*60}")
+print(f"Results saved in: {app.results_dir}")
+print(f"Generated configs in: {app.generated_dir}")
+
+if name == "main":
+main()
